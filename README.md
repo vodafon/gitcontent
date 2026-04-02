@@ -17,6 +17,12 @@ It is designed for repository-wide text inspection workflows (for example, searc
 
 ## Installation
 
+### Install with Go
+
+```bash
+go install github.com/vodafon/gitcontent@latest
+```
+
 ### Build locally
 
 ```bash
@@ -38,7 +44,7 @@ printf '%s\n' \
   'https://github.com/octocat/Hello-World' \
   'git@github.com:owner/repo.git' \
   'github.com/owner/repo' \
-| ./gitcontent
+| gitcontent
 ```
 
 By default, output files are written to `./out`.
@@ -118,7 +124,7 @@ A blob is treated as binary and skipped if any of these are true:
 ## Typical workflow for sensitive-data search
 
 ```bash
-printf '%s\n' 'https://github.com/org/repo' | ./gitcontent -out out
+printf '%s\n' 'https://github.com/org/repo' | gitcontent -out out
 grep -RniE '(api[_-]?key|secret|password|token)' out/
 ```
 
