@@ -13,6 +13,7 @@ var (
 	flagOut             = flag.String("out", "out", "out dir")
 	flagMaxCloneSeconds = flag.Int("max-clone-seconds", 300, "skip repository when clone exceeds this number of seconds")
 	flagMaxOutputBytes  = flag.Int64("max-output-bytes", 1073741824, "maximum bytes per output file before stopping repository processing")
+	flagInsecure        = flag.Bool("insecure", true, "skip TLS certificate verification")
 )
 
 func main() {
@@ -24,6 +25,7 @@ func main() {
 		verbose:         *flagV,
 		maxCloneSeconds: *flagMaxCloneSeconds,
 		maxOutputBytes:  *flagMaxOutputBytes,
+		insecure:        *flagInsecure,
 		l:               logger,
 	}
 

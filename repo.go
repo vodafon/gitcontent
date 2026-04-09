@@ -26,6 +26,7 @@ type Worker struct {
 	verbose         int
 	maxCloneSeconds int
 	maxOutputBytes  int64
+	insecure        bool
 	l               *slog.Logger
 }
 
@@ -111,14 +112,20 @@ func (obj *Worker) cloneRepo(repoURL, repoDir string) (*git.Repository, error) {
 		defer cancel()
 	}
 
-	return plainCloneContext(ctx, repoDir, false, &git.CloneOptions{
+	cloneOpts := &git.CloneOptions{
 		URL:               repoURL,
 		Progress:          os.Stdout,
 		Depth:             0,
 		SingleBranch:      false,
 		Tags:              git.AllTags,
 		RecurseSubmodules: git.NoRecurseSubmodules,
-	})
+	}
+
+	if obj.insecure {
+		cloneOpts.InsecureSkipTLS = true
+	}
+
+	return plainCloneContext(ctx, repoDir, false, cloneOpts)
 }
 
 func (obj *Worker) processAllRefs(repo *git.Repository, output io.Writer) error {
