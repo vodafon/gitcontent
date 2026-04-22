@@ -109,7 +109,8 @@ func (obj *Worker) Repo(repoInput string) error {
 		return fmt.Errorf("process refs: %w", err)
 	}
 
-	if err := obj.resolveRedactedBlobs(repo, spec, writer); err != nil {
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	if err := obj.resolveRedactedBlobs(repo, spec, writer, httpClient); err != nil {
 		if errors.Is(err, errOutputLimitReached) {
 			obj.log(1, "stopping resolution because output limit reached", "repo", spec.URL)
 			return nil
@@ -276,12 +277,10 @@ func (obj *Worker) saveCommitFiles(commit *object.Commit, output io.Writer, proc
 	})
 }
 
-func (obj *Worker) resolveRedactedBlobs(repo *git.Repository, spec repoSpec, output io.Writer) error {
+func (obj *Worker) resolveRedactedBlobs(repo *git.Repository, spec repoSpec, output io.Writer, httpClient *http.Client) error {
 	if !obj.resolveRedacted || len(obj.redactedBlobs) == 0 || spec.Host != "github.com" {
 		return nil
 	}
-
-	httpClient := &http.Client{Timeout: 30 * time.Second}
 
 	blobCache := make(map[string][]byte)
 
