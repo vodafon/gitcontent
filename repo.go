@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -57,6 +58,7 @@ func (obj *Worker) Repo(repoInput string) error {
 	if err != nil {
 		return err
 	}
+	obj.redactedBlobs = nil
 
 	if err := os.MkdirAll(obj.outDir, os.ModePerm); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
@@ -105,6 +107,14 @@ func (obj *Worker) Repo(repoInput string) error {
 			return nil
 		}
 		return fmt.Errorf("process refs: %w", err)
+	}
+
+	if err := obj.resolveRedactedBlobs(repo, spec, writer); err != nil {
+		if errors.Is(err, errOutputLimitReached) {
+			obj.log(1, "stopping resolution because output limit reached", "repo", spec.URL)
+			return nil
+		}
+		return fmt.Errorf("resolve redacted blobs: %w", err)
 	}
 
 	obj.log(2, "repository processed", "repo", spec.URL, "output", outputPath)
@@ -264,6 +274,105 @@ func (obj *Worker) saveCommitFiles(commit *object.Commit, output io.Writer, proc
 		processedBlobs[blobHash] = true
 		return nil
 	})
+}
+
+func (obj *Worker) resolveRedactedBlobs(repo *git.Repository, spec repoSpec, output io.Writer) error {
+	if !obj.resolveRedacted || len(obj.redactedBlobs) == 0 || spec.Host != "github.com" {
+		return nil
+	}
+
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+
+	blobCache := make(map[string][]byte)
+
+	commitBlobMap := make(map[string][]redactedBlob)
+	for _, rb := range obj.redactedBlobs {
+		commitBlobMap[rb.commitHash] = append(commitBlobMap[rb.commitHash], rb)
+	}
+
+	for commitHashStr, blobs := range commitBlobMap {
+		commitHash := plumbing.NewHash(commitHashStr)
+		commit, err := repo.CommitObject(commitHash)
+		if err != nil {
+			obj.log(1, "cannot get commit object for resolution", "commit", commitHashStr, "error", err)
+			continue
+		}
+
+		treeSHA := commit.TreeHash.String()
+		apiTree, err := fetchTree(httpClient, spec.Owner, spec.Repo, treeSHA, obj.githubToken)
+		if err != nil {
+			if strings.Contains(err.Error(), "rate limited") {
+				obj.log(1, "GitHub API rate limited — set GITHUB_TOKEN env var for 5000 req/hr", "repo", spec.URL)
+				return nil
+			}
+			obj.log(1, "failed to fetch GitHub tree for resolution", "commit", commitHashStr, "error", err)
+			continue
+		}
+
+		if apiTree.Truncated {
+			obj.log(1, "GitHub API tree is truncated — some blobs may not be resolved", "commit", commitHashStr)
+		}
+
+		apiPathSHA := make(map[string]string)
+		for _, entry := range apiTree.Tree {
+			if entry.Type == "blob" {
+				apiPathSHA[entry.Path] = entry.SHA
+			}
+		}
+
+		localTree, err := commit.Tree()
+		if err != nil {
+			obj.log(1, "cannot get local tree for commit", "commit", commitHashStr, "error", err)
+			continue
+		}
+		clonePathSHA := make(map[string]string)
+		_ = localTree.Files().ForEach(func(f *object.File) error {
+			clonePathSHA[f.Name] = f.Hash.String()
+			return nil
+		})
+
+		for _, rb := range blobs {
+			apiSHA, hasAPIEntry := apiPathSHA[rb.path]
+			if !hasAPIEntry {
+				obj.log(1, "path not found in API tree, skipping", "path", rb.path)
+				continue
+			}
+
+			cloneSHA := clonePathSHA[rb.path]
+			if cloneSHA == apiSHA {
+				obj.log(2, "SHA match — marker is legitimate content, skipping resolution", "path", rb.path)
+				continue
+			}
+
+			content, cached := blobCache[apiSHA]
+			if !cached {
+				fetched, err := fetchBlob(httpClient, spec.Owner, spec.Repo, apiSHA, obj.githubToken)
+				if err != nil {
+					if strings.Contains(err.Error(), "rate limited") {
+						obj.log(1, "GitHub API rate limited — set GITHUB_TOKEN env var for 5000 req/hr", "repo", spec.URL)
+						return nil
+					}
+					obj.log(1, "failed to fetch blob for resolution", "path", rb.path, "sha", apiSHA, "error", err)
+					continue
+				}
+				blobCache[apiSHA] = fetched
+				content = fetched
+			}
+
+			header := fmt.Sprintf("\n==== Blob %s | Commit %s | Path %s | Resolved ====\n", apiSHA, rb.commitHash, rb.path)
+			if _, err := io.WriteString(output, header); err != nil {
+				return err
+			}
+			if _, err := output.Write(content); err != nil {
+				return err
+			}
+			if _, err := io.WriteString(output, "\n"); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 func readBlobContent(blob *object.Blob) ([]byte, error) {
