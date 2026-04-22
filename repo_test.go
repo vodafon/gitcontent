@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -764,5 +765,326 @@ func TestResolveBudgetEnforcement(t *testing.T) {
 	err = worker.Repo("https://github.com/test/testrepo")
 	if err != nil {
 		t.Fatalf("expected no error even when budget exceeded, got: %v", err)
+	}
+}
+
+func TestRateLimitStopsAll(t *testing.T) {
+	repoDir := t.TempDir()
+	repo, err := git.PlainInit(repoDir, false)
+	if err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "file1.txt"), []byte("val = '***REMOVED***'"), 0644); err != nil {
+		t.Fatalf("write file1: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "file2.txt"), []byte("key = '***REMOVED***'"), 0644); err != nil {
+		t.Fatalf("write file2: %v", err)
+	}
+	if _, err := wt.Add("file1.txt"); err != nil {
+		t.Fatalf("git add file1: %v", err)
+	}
+	if _, err := wt.Add("file2.txt"); err != nil {
+		t.Fatalf("git add file2: %v", err)
+	}
+	if _, err := wt.Commit("initial", &git.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@t.com", When: time.Now()}}); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	fetchTreeCallCount := 0
+	fetchBlobCallCount := 0
+	origFetchTree := fetchTree
+	fetchTree = func(httpClient *http.Client, owner, r, tSHA, token string) (*githubTree, error) {
+		fetchTreeCallCount++
+		return nil, fmt.Errorf("GitHub API rate limited — set GITHUB_TOKEN env var for 5000 req/hr")
+	}
+	t.Cleanup(func() { fetchTree = origFetchTree })
+
+	origFetchBlob := fetchBlob
+	fetchBlob = func(httpClient *http.Client, owner, r, bSHA, token string) ([]byte, error) {
+		fetchBlobCallCount++
+		return []byte("should-not-be-called\n"), nil
+	}
+	t.Cleanup(func() { fetchBlob = origFetchBlob })
+
+	outDir := t.TempDir()
+	worker := &Worker{outDir: outDir, verbose: 1, maxCloneSeconds: 300, maxOutputBytes: 1024 * 1024, resolveRedacted: true, l: slog.New(slog.NewTextHandler(os.Stderr, nil))}
+
+	if err := worker.Repo("https://github.com/owner/testrepo"); err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+	if fetchTreeCallCount != 1 {
+		t.Fatalf("expected one tree fetch before rate limit stop, got %d", fetchTreeCallCount)
+	}
+	if fetchBlobCallCount != 0 {
+		t.Fatalf("expected no blob fetches after rate limit, got %d", fetchBlobCallCount)
+	}
+
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("read out dir: %v", err)
+	}
+	outputBytes, err := os.ReadFile(filepath.Join(outDir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if strings.Contains(string(outputBytes), "| Resolved") {
+		t.Fatalf("output should not contain resolved blobs after rate limit: %s", string(outputBytes))
+	}
+}
+
+func TestEdgeBlobAPIPartialFailure(t *testing.T) {
+	repoDir := t.TempDir()
+	repo, err := git.PlainInit(repoDir, false)
+	if err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "first.txt"), []byte("val = '***REMOVED***'"), 0644); err != nil {
+		t.Fatalf("write first: %v", err)
+	}
+	if _, err := wt.Add("first.txt"); err != nil {
+		t.Fatalf("git add first: %v", err)
+	}
+	if _, err := wt.Commit("first", &git.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@t.com", When: time.Now()}}); err != nil {
+		t.Fatalf("git commit first: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "second.txt"), []byte("key = '***REMOVED***'"), 0644); err != nil {
+		t.Fatalf("write second: %v", err)
+	}
+	if _, err := wt.Add("second.txt"); err != nil {
+		t.Fatalf("git add second: %v", err)
+	}
+	if _, err := wt.Commit("second", &git.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@t.com", When: time.Now()}}); err != nil {
+		t.Fatalf("git commit second: %v", err)
+	}
+
+	head, err := repo.Head()
+	if err != nil {
+		t.Fatalf("repo head: %v", err)
+	}
+	commit, err := repo.CommitObject(head.Hash())
+	if err != nil {
+		t.Fatalf("commit object: %v", err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("tree: %v", err)
+	}
+	firstFile, err := tree.File("first.txt")
+	if err != nil {
+		t.Fatalf("tree file first: %v", err)
+	}
+	secondFile, err := tree.File("second.txt")
+	if err != nil {
+		t.Fatalf("tree file second: %v", err)
+	}
+	apiFirstSHA := "1111111111111111111111111111111111111111"
+	apiSecondSHA := "2222222222222222222222222222222222222222"
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	origFetchTree := fetchTree
+	fetchTree = func(httpClient *http.Client, owner, r, tSHA, token string) (*githubTree, error) {
+		return &githubTree{SHA: tSHA, Tree: []githubTreeEntry{{Path: "first.txt", SHA: apiFirstSHA, Type: "blob"}, {Path: "second.txt", SHA: apiSecondSHA, Type: "blob"}}}, nil
+	}
+	t.Cleanup(func() { fetchTree = origFetchTree })
+
+	fetchBlobCalls := 0
+	origFetchBlob := fetchBlob
+	fetchBlob = func(httpClient *http.Client, owner, r, bSHA, token string) ([]byte, error) {
+		fetchBlobCalls++
+		if fetchBlobCalls == 1 {
+			return nil, fmt.Errorf("GitHub API server error (HTTP 500)")
+		}
+		return []byte("resolved-content\n"), nil
+	}
+	t.Cleanup(func() { fetchBlob = origFetchBlob })
+
+	outDir := t.TempDir()
+	worker := &Worker{outDir: outDir, verbose: 1, maxCloneSeconds: 300, maxOutputBytes: 1024 * 1024, resolveRedacted: true, l: slog.New(slog.NewTextHandler(os.Stderr, nil))}
+
+	if firstFile.Hash.String() == apiFirstSHA || secondFile.Hash.String() == apiSecondSHA {
+		t.Fatal("test setup requires API SHAs to differ from clone SHAs")
+	}
+	if err := worker.Repo("https://github.com/owner/testrepo"); err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("read out dir: %v", err)
+	}
+	outputBytes, err := os.ReadFile(filepath.Join(outDir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	output := string(outputBytes)
+	if strings.Contains(output, fmt.Sprintf("==== Blob %s | Commit %s | Path first.txt | Resolved ====", apiFirstSHA, worker.redactedBlobs[0].commitHash)) {
+		t.Fatalf("first blob should not resolve after blob API failure: %s", output)
+	}
+	if !strings.Contains(output, "==== Blob "+apiSecondSHA) || !strings.Contains(output, "Path second.txt | Resolved") || !strings.Contains(output, "resolved-content") {
+		t.Fatalf("second blob should resolve successfully: %s", output)
+	}
+}
+
+func TestEdgeBlobDedup(t *testing.T) {
+	repoDir := t.TempDir()
+	repo, err := git.PlainInit(repoDir, false)
+	if err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	files := []string{"one.txt", "two.txt", "three.txt"}
+	for i, name := range files {
+		content := fmt.Sprintf("secret%d = '***REMOVED***'", i+1)
+		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(content), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		if _, err := wt.Add(name); err != nil {
+			t.Fatalf("git add %s: %v", name, err)
+		}
+	}
+	if _, err := wt.Commit("initial", &git.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@t.com", When: time.Now()}}); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	apiSHA := "cccccccccccccccccccccccccccccccccccccccc"
+	origFetchTree := fetchTree
+	fetchTree = func(httpClient *http.Client, owner, r, tSHA, token string) (*githubTree, error) {
+		return &githubTree{SHA: tSHA, Tree: []githubTreeEntry{{Path: "one.txt", SHA: apiSHA, Type: "blob"}, {Path: "two.txt", SHA: apiSHA, Type: "blob"}, {Path: "three.txt", SHA: apiSHA, Type: "blob"}}}, nil
+	}
+	t.Cleanup(func() { fetchTree = origFetchTree })
+
+	fetchBlobCallCount := 0
+	origFetchBlob := fetchBlob
+	fetchBlob = func(httpClient *http.Client, owner, r, bSHA, token string) ([]byte, error) {
+		fetchBlobCallCount++
+		return []byte("deduped-content\n"), nil
+	}
+	t.Cleanup(func() { fetchBlob = origFetchBlob })
+
+	outDir := t.TempDir()
+	worker := &Worker{outDir: outDir, verbose: 1, maxCloneSeconds: 300, maxOutputBytes: 1024 * 1024, resolveRedacted: true, l: slog.New(slog.NewTextHandler(os.Stderr, nil))}
+
+	if err := worker.Repo("https://github.com/owner/testrepo"); err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+	if fetchBlobCallCount != 1 {
+		t.Fatalf("expected fetchBlob to be called once for dedup, got %d", fetchBlobCallCount)
+	}
+
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("read out dir: %v", err)
+	}
+	outputBytes, err := os.ReadFile(filepath.Join(outDir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if count := strings.Count(string(outputBytes), "| Resolved ===="); count != 3 {
+		t.Fatalf("expected 3 resolved sections, got %d: %s", count, string(outputBytes))
+	}
+}
+
+func TestEdgeRedactedBlobsResetPerRepo(t *testing.T) {
+	firstRepoDir := t.TempDir()
+	firstRepo, err := git.PlainInit(firstRepoDir, false)
+	if err != nil {
+		t.Fatalf("git init first: %v", err)
+	}
+	firstWT, err := firstRepo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree first: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(firstRepoDir, "secret.txt"), []byte("password = '***REMOVED***'"), 0644); err != nil {
+		t.Fatalf("write first repo file: %v", err)
+	}
+	if _, err := firstWT.Add("secret.txt"); err != nil {
+		t.Fatalf("git add first repo: %v", err)
+	}
+	if _, err := firstWT.Commit("first", &git.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@t.com", When: time.Now()}}); err != nil {
+		t.Fatalf("git commit first repo: %v", err)
+	}
+
+	secondRepoDir := t.TempDir()
+	secondRepo, err := git.PlainInit(secondRepoDir, false)
+	if err != nil {
+		t.Fatalf("git init second: %v", err)
+	}
+	secondWT, err := secondRepo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree second: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(secondRepoDir, "normal.txt"), []byte("normal content"), 0644); err != nil {
+		t.Fatalf("write second repo file: %v", err)
+	}
+	if _, err := secondWT.Add("normal.txt"); err != nil {
+		t.Fatalf("git add second repo: %v", err)
+	}
+	if _, err := secondWT.Commit("second", &git.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@t.com", When: time.Now()}}); err != nil {
+		t.Fatalf("git commit second repo: %v", err)
+	}
+
+	repos := []*git.Repository{firstRepo, secondRepo}
+	repoIndex := 0
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		repo := repos[repoIndex]
+		repoIndex++
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	fetchTreeCalls := 0
+	origFetchTree := fetchTree
+	fetchTree = func(httpClient *http.Client, owner, r, tSHA, token string) (*githubTree, error) {
+		fetchTreeCalls++
+		return nil, fmt.Errorf("GitHub API rate limited — set GITHUB_TOKEN env var for 5000 req/hr")
+	}
+	t.Cleanup(func() { fetchTree = origFetchTree })
+
+	outDir := t.TempDir()
+	worker := &Worker{outDir: outDir, verbose: 1, maxCloneSeconds: 300, maxOutputBytes: 1024 * 1024, resolveRedacted: true, l: slog.New(slog.NewTextHandler(os.Stderr, nil))}
+
+	if err := worker.Repo("https://github.com/owner/first"); err != nil {
+		t.Fatalf("first worker.Repo: %v", err)
+	}
+	if len(worker.redactedBlobs) == 0 {
+		t.Fatal("expected first repo to populate redactedBlobs")
+	}
+	if err := worker.Repo("https://github.com/owner/second"); err != nil {
+		t.Fatalf("second worker.Repo: %v", err)
+	}
+	if len(worker.redactedBlobs) != 0 {
+		t.Fatalf("expected redactedBlobs reset for second repo, got %d", len(worker.redactedBlobs))
+	}
+	if fetchTreeCalls != 1 {
+		t.Fatalf("expected fetchTree called only for first repo, got %d", fetchTreeCalls)
 	}
 }
