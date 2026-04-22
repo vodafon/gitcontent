@@ -21,6 +21,12 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
+type redactedBlob struct {
+	blobHash   string
+	commitHash string
+	path       string
+}
+
 type Worker struct {
 	outDir          string
 	verbose         int
@@ -28,6 +34,9 @@ type Worker struct {
 	maxOutputBytes  int64
 	insecure        bool
 	l               *slog.Logger
+	resolveRedacted bool
+	githubToken     string
+	redactedBlobs   []redactedBlob
 }
 
 type repoSpec struct {
@@ -231,6 +240,14 @@ func (obj *Worker) saveCommitFiles(commit *object.Commit, output io.Writer, proc
 			obj.log(3, "skipping binary file", "path", f.Name, "blob", blobHash)
 			processedBlobs[blobHash] = true
 			return nil
+		}
+
+		if bytes.Contains(content, []byte("***REMOVED***")) && obj.resolveRedacted {
+			obj.redactedBlobs = append(obj.redactedBlobs, redactedBlob{
+				blobHash:   blobHash,
+				commitHash: commit.Hash.String(),
+				path:       f.Name,
+			})
 		}
 
 		header := fmt.Sprintf("\n==== Blob %s | Commit %s | Path %s ====\n", blobHash, commit.Hash.String(), f.Name)
