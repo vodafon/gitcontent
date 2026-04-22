@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
@@ -282,6 +283,151 @@ func (obj *Worker) resolveRedactedBlobs(repo *git.Repository, spec repoSpec, out
 		return nil
 	}
 
+	resolved, err := obj.resolveRedactedViaOriginalHistory(repo, spec, output, httpClient)
+	if err != nil {
+		return err
+	}
+	if resolved {
+		return nil
+	}
+
+	return obj.resolveRedactedViaCurrentTreeAPI(repo, spec, output, httpClient)
+}
+
+func (obj *Worker) resolveRedactedViaOriginalHistory(repo *git.Repository, spec repoSpec, output io.Writer, httpClient *http.Client) (bool, error) {
+	rewriteBaseSHA, err := obj.findRewriteBaseSHA(repo, spec, httpClient)
+	if err != nil {
+		if strings.Contains(err.Error(), "rate limited") {
+			obj.log(1, "GitHub API rate limited — set GITHUB_TOKEN env var for 5000 req/hr", "repo", spec.URL)
+			return true, nil
+		}
+		obj.log(1, "failed to discover rewrite base", "repo", spec.URL, "error", err)
+		return false, nil
+	}
+
+	if rewriteBaseSHA == "" {
+		obj.log(2, "no rewrite base found, using tree/blob API resolution", "repo", spec.URL)
+		return false, nil
+	}
+
+	originalCommits, err := fetchCommitsFromSHA(httpClient, spec.Owner, spec.Repo, rewriteBaseSHA, obj.githubToken)
+	if err != nil {
+		if strings.Contains(err.Error(), "rate limited") {
+			obj.log(1, "GitHub API rate limited — set GITHUB_TOKEN env var for 5000 req/hr", "repo", spec.URL)
+			return true, nil
+		}
+		obj.log(1, "failed to fetch original commit chain", "repo", spec.URL, "base_sha", rewriteBaseSHA, "error", err)
+		return false, nil
+	}
+
+	originalByIdentity := make(map[string]string)
+	for _, c := range originalCommits {
+		if c.SHA == "" || c.Commit.Message == "" || c.Commit.Author.Date == "" {
+			continue
+		}
+		tm, parseErr := time.Parse(time.RFC3339, c.Commit.Author.Date)
+		if parseErr != nil {
+			continue
+		}
+		identity := commitIdentityKey(c.Commit.Message, tm)
+		if _, exists := originalByIdentity[identity]; !exists {
+			originalByIdentity[identity] = c.SHA
+		}
+	}
+
+	blobCache := make(map[string][]byte)
+	commitBlobMap := make(map[string][]redactedBlob)
+	for _, rb := range obj.redactedBlobs {
+		commitBlobMap[rb.commitHash] = append(commitBlobMap[rb.commitHash], rb)
+	}
+
+	for cloneCommitSHA, blobs := range commitBlobMap {
+		cloneCommitHash := plumbing.NewHash(cloneCommitSHA)
+		cloneCommit, cloneErr := repo.CommitObject(cloneCommitHash)
+		if cloneErr != nil {
+			obj.log(1, "cannot get local commit for redaction resolution", "commit", cloneCommitSHA, "error", cloneErr)
+			continue
+		}
+
+		identity := commitIdentityKey(cloneCommit.Message, cloneCommit.Author.When)
+		originalCommitSHA := originalByIdentity[identity]
+		if originalCommitSHA == "" {
+			obj.log(2, "no original commit match for redacted commit", "clone_commit", cloneCommitSHA)
+			continue
+		}
+
+		originalCommitHash := plumbing.NewHash(originalCommitSHA)
+		originalCommit, origErr := repo.CommitObject(originalCommitHash)
+		if origErr != nil {
+			if fetchErr := obj.fetchOriginalCommitBySHA(repo, originalCommitSHA); fetchErr != nil {
+				obj.log(1, "failed to fetch original commit by SHA", "sha", originalCommitSHA, "error", fetchErr)
+				continue
+			}
+			originalCommit, origErr = repo.CommitObject(originalCommitHash)
+			if origErr != nil {
+				obj.log(1, "fetched original commit but cannot read commit object", "sha", originalCommitSHA, "error", origErr)
+				continue
+			}
+		}
+
+		originalTree, treeErr := originalCommit.Tree()
+		if treeErr != nil {
+			obj.log(1, "cannot get original tree for commit", "commit", originalCommitSHA, "error", treeErr)
+			continue
+		}
+
+		originalPathSHA := make(map[string]string)
+		_ = originalTree.Files().ForEach(func(f *object.File) error {
+			originalPathSHA[f.Name] = f.Hash.String()
+			return nil
+		})
+
+		for _, rb := range blobs {
+			originalBlobSHA := originalPathSHA[rb.path]
+			if originalBlobSHA == "" {
+				obj.log(2, "path not found in original tree", "path", rb.path, "original_commit", originalCommitSHA)
+				continue
+			}
+
+			if originalBlobSHA == rb.blobHash {
+				obj.log(2, "SHA match — marker is legitimate content, skipping resolution", "path", rb.path)
+				continue
+			}
+
+			content, cached := blobCache[originalBlobSHA]
+			if !cached {
+				blobObj, blobErr := repo.BlobObject(plumbing.NewHash(originalBlobSHA))
+				if blobErr != nil {
+					obj.log(1, "original blob not present locally after commit fetch", "sha", originalBlobSHA, "path", rb.path, "error", blobErr)
+					continue
+				}
+				readContent, readErr := readBlobContent(blobObj)
+				if readErr != nil {
+					obj.log(1, "failed to read original blob content", "sha", originalBlobSHA, "path", rb.path, "error", readErr)
+					continue
+				}
+				blobCache[originalBlobSHA] = readContent
+				content = readContent
+			}
+
+			header := fmt.Sprintf("\n==== Blob %s | Commit %s | Path %s | Resolved ====\n", originalBlobSHA, rb.commitHash, rb.path)
+			if _, writeErr := io.WriteString(output, header); writeErr != nil {
+				return true, writeErr
+			}
+			if _, writeErr := output.Write(content); writeErr != nil {
+				return true, writeErr
+			}
+			if _, writeErr := io.WriteString(output, "\n"); writeErr != nil {
+				return true, writeErr
+			}
+		}
+	}
+
+	return true, nil
+}
+
+func (obj *Worker) resolveRedactedViaCurrentTreeAPI(repo *git.Repository, spec repoSpec, output io.Writer, httpClient *http.Client) error {
+
 	blobCache := make(map[string][]byte)
 
 	commitBlobMap := make(map[string][]redactedBlob)
@@ -372,6 +518,72 @@ func (obj *Worker) resolveRedactedBlobs(repo *git.Repository, spec repoSpec, out
 	}
 
 	return nil
+}
+
+func (obj *Worker) findRewriteBaseSHA(repo *git.Repository, spec repoSpec, httpClient *http.Client) (string, error) {
+	for page := 1; page <= 3; page++ {
+		events, err := fetchEvents(httpClient, spec.Owner, spec.Repo, obj.githubToken, page)
+		if err != nil {
+			if strings.Contains(err.Error(), "invalid token") {
+				return "", fmt.Errorf("GitHub API: invalid token (HTTP 401)")
+			}
+			return "", err
+		}
+		if len(events) == 0 {
+			return "", nil
+		}
+
+		for _, evt := range events {
+			if evt.Type != "PushEvent" {
+				continue
+			}
+			if evt.Payload.Ref != "refs/heads/main" {
+				continue
+			}
+
+			headSHA := strings.TrimSpace(evt.Payload.Head)
+			beforeSHA := strings.TrimSpace(evt.Payload.Before)
+			if len(headSHA) != 40 || len(beforeSHA) != 40 {
+				continue
+			}
+
+			if _, headErr := repo.CommitObject(plumbing.NewHash(headSHA)); headErr != nil {
+				continue
+			}
+			if _, beforeErr := repo.CommitObject(plumbing.NewHash(beforeSHA)); beforeErr == nil {
+				continue
+			}
+
+			return beforeSHA, nil
+		}
+	}
+
+	return "", nil
+}
+
+func (obj *Worker) fetchOriginalCommitBySHA(repo *git.Repository, commitSHA string) error {
+	if len(commitSHA) != 40 {
+		return fmt.Errorf("invalid commit SHA length: %s", commitSHA)
+	}
+
+	shortSHA := commitSHA[:12]
+	refSpec := config.RefSpec("+" + commitSHA + ":refs/gitcontent/original/" + shortSHA)
+	err := repo.Fetch(&git.FetchOptions{
+		RemoteName:      "origin",
+		RefSpecs:        []config.RefSpec{refSpec},
+		InsecureSkipTLS: obj.insecure,
+		Tags:            git.NoTags,
+	})
+	if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+		return err
+	}
+
+	return nil
+}
+
+func commitIdentityKey(message string, authorTime time.Time) string {
+	normalizedMessage := strings.TrimSpace(strings.SplitN(message, "\n", 2)[0])
+	return normalizedMessage + "|" + authorTime.UTC().Format(time.RFC3339)
 }
 
 func readBlobContent(blob *object.Blob) ([]byte, error) {

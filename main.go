@@ -15,7 +15,7 @@ var (
 	flagMaxCloneSeconds = flag.Int("max-clone-seconds", 300, "skip repository when clone exceeds this number of seconds")
 	flagMaxOutputBytes  = flag.Int64("max-output-bytes", 1073741824, "maximum bytes per output file before stopping repository processing")
 	flagInsecure        = flag.Bool("insecure", true, "skip TLS certificate verification")
-	flagResolveRedacted = flag.Bool("resolve-redacted", false, "resolve GitHub-redacted secrets (***REMOVED***) via API; optionally set GITHUB_TOKEN env var for higher rate limits")
+	flagResolveRedacted = flag.Bool("resolve-redacted", true, "resolve GitHub-redacted secrets (***REMOVED***) via API; optionally set GITHUB_TOKEN env var for higher rate limits")
 )
 
 func main() {
@@ -27,7 +27,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  printf 'https://github.com/owner/repo' | gitcontent\n\n")
 		fmt.Fprintf(os.Stderr, "Example with secret redaction bypass:\n")
 		fmt.Fprintf(os.Stderr, "  export GITHUB_TOKEN=ghp_xxx\n")
-		fmt.Fprintf(os.Stderr, "  printf 'https://github.com/owner/repo' | gitcontent -resolve-redacted\n\n")
+		fmt.Fprintf(os.Stderr, "  printf 'https://github.com/owner/repo' | gitcontent\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 	}

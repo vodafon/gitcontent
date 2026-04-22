@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -32,6 +33,30 @@ type githubBlob struct {
 
 var fetchTree func(httpClient *http.Client, owner, repo, treeSHA, token string) (*githubTree, error) = fetchGitHubTree
 var fetchBlob func(httpClient *http.Client, owner, repo, blobSHA, token string) ([]byte, error) = fetchGitHubBlob
+var fetchEvents func(httpClient *http.Client, owner, repo, token string, page int) ([]githubEvent, error) = fetchGitHubEvents
+var fetchCommitsFromSHA func(httpClient *http.Client, owner, repo, sha, token string) ([]githubCommitListItem, error) = fetchGitHubCommitsFromSHA
+
+type githubEvent struct {
+	Type    string `json:"type"`
+	Payload struct {
+		Ref    string `json:"ref"`
+		Head   string `json:"head"`
+		Before string `json:"before"`
+	} `json:"payload"`
+}
+
+type githubCommitListItem struct {
+	SHA    string `json:"sha"`
+	Commit struct {
+		Message string `json:"message"`
+		Author  struct {
+			Date string `json:"date"`
+		} `json:"author"`
+		Tree struct {
+			SHA string `json:"sha"`
+		} `json:"tree"`
+	} `json:"commit"`
+}
 
 func fetchGitHubTree(httpClient *http.Client, owner, repo, treeSHA, token string) (*githubTree, error) {
 	url := fmt.Sprintf("%s/repos/%s/%s/git/trees/%s?recursive=1", githubAPIBaseURL, owner, repo, treeSHA)
@@ -108,6 +133,78 @@ func fetchGitHubBlob(httpClient *http.Client, owner, repo, blobSHA, token string
 	}
 
 	return decoded, nil
+}
+
+func fetchGitHubEvents(httpClient *http.Client, owner, repo, token string, page int) ([]githubEvent, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/events?per_page=100&page=%d", githubAPIBaseURL, owner, repo, page)
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := handleGitHubAPIError(resp); err != nil {
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var events []githubEvent
+	if err := json.Unmarshal(body, &events); err != nil {
+		return nil, err
+	}
+
+	return events, nil
+}
+
+func fetchGitHubCommitsFromSHA(httpClient *http.Client, owner, repo, sha, token string) ([]githubCommitListItem, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/commits?per_page=100&sha=%s", githubAPIBaseURL, owner, repo, url.QueryEscape(sha))
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if err := handleGitHubAPIError(resp); err != nil {
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var commits []githubCommitListItem
+	if err := json.Unmarshal(body, &commits); err != nil {
+		return nil, err
+	}
+
+	return commits, nil
 }
 
 func handleGitHubAPIError(resp *http.Response) error {
