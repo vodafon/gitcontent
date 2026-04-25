@@ -294,6 +294,71 @@ func TestDetectRedactedMarker(t *testing.T) {
 	}
 }
 
+func TestDetectRedactedMarkerRedacted(t *testing.T) {
+	repoDir := t.TempDir()
+	repo, err := git.PlainInit(repoDir, false)
+	if err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+
+	filePath := filepath.Join(repoDir, "secret.txt")
+	if err := os.WriteFile(filePath, []byte("password = '***REDACTED***'"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	if _, err := wt.Add("secret.txt"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+
+	commit, err := wt.Commit("initial", &git.CommitOptions{
+		Author: &object.Signature{
+			Name:  "test",
+			Email: "test@test.com",
+			When:  time.Now(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	defer func() { plainCloneContext = origClone }()
+
+	worker := &Worker{
+		outDir:          t.TempDir(),
+		verbose:         1,
+		maxCloneSeconds: 300,
+		maxOutputBytes:  1024 * 1024,
+		resolveRedacted: true,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	err = worker.Repo("https://github.com/test/repo")
+	if err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+
+	if len(worker.redactedBlobs) != 1 {
+		t.Fatalf("expected 1 redacted blob for ***REDACTED*** marker, got %d", len(worker.redactedBlobs))
+	}
+
+	rb := worker.redactedBlobs[0]
+	if rb.commitHash != commit.String() {
+		t.Fatalf("commit hash mismatch: got %s want %s", rb.commitHash, commit.String())
+	}
+	if rb.path != "secret.txt" {
+		t.Fatalf("path mismatch: got %s want secret.txt", rb.path)
+	}
+}
+
 func TestDetectRedactedNoFalsePositive(t *testing.T) {
 	repoDir := t.TempDir()
 	repo, err := git.PlainInit(repoDir, false)

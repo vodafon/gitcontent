@@ -254,7 +254,7 @@ func (obj *Worker) saveCommitFiles(commit *object.Commit, output io.Writer, proc
 			return nil
 		}
 
-		if bytes.Contains(content, []byte("***REMOVED***")) && obj.resolveRedacted {
+		if (bytes.Contains(content, []byte("***REMOVED***")) || bytes.Contains(content, []byte("***REDACTED***"))) && obj.resolveRedacted {
 			obj.redactedBlobs = append(obj.redactedBlobs, redactedBlob{
 				blobHash:   blobHash,
 				commitHash: commit.Hash.String(),
