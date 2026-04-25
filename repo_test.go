@@ -1587,6 +1587,14 @@ func TestSplitResolvedFilesCreated(t *testing.T) {
 	}
 	t.Cleanup(func() { plainCloneContext = origClone })
 
+	// Mock fetchEvents to return empty (no rewrite base found), so resolveRedactedViaOriginalHistory
+	// falls through to resolveRedactedViaCurrentTreeAPI instead of short-circuiting on rate limit.
+	origFetchEvents := fetchEvents
+	fetchEvents = func(httpClient *http.Client, owner, r, token string, page int) ([]githubEvent, error) {
+		return []githubEvent{}, nil
+	}
+	t.Cleanup(func() { fetchEvents = origFetchEvents })
+
 	origFetchTree := fetchTree
 	fetchTree = func(httpClient *http.Client, owner, r, tSHA, token string) (*githubTree, error) {
 		if tSHA != treeSHA {
@@ -1762,6 +1770,12 @@ func TestSplitResolvedNestedPath(t *testing.T) {
 		return repo, nil
 	}
 	t.Cleanup(func() { plainCloneContext = origClone })
+
+	origFetchEvents := fetchEvents
+	fetchEvents = func(httpClient *http.Client, owner, r, token string, page int) ([]githubEvent, error) {
+		return []githubEvent{}, nil
+	}
+	t.Cleanup(func() { fetchEvents = origFetchEvents })
 
 	origFetchTree := fetchTree
 	fetchTree = func(httpClient *http.Client, owner, r, tSHA, token string) (*githubTree, error) {
