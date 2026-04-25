@@ -60,6 +60,12 @@ By default, output files are written to `./out`.
     skip repository when clone exceeds this number of seconds (default 300)
 -max-output-bytes int
     maximum bytes per output file before stopping repository processing (default 1073741824)
+-split bool
+    also create individual per-blob files preserving directory structure (default true)
+-insecure bool
+    skip TLS certificate verification (default true)
+-resolve-redacted bool
+    resolve GitHub-redacted secrets (***REMOVED***, ***REDACTED***) via API; optionally set GITHUB_TOKEN env var for higher rate limits (default true)
 ```
 
 ## Input formats
@@ -79,7 +85,7 @@ Normalization behavior:
 
 ## Output
 
-For each repository, `gitcontent` creates:
+For each repository, `gitcontent` creates a monolithic text file:
 
 ```text
 {outDir}/{safe_host}_{safe_owner}_{safe_repo}_content.txt
@@ -98,6 +104,33 @@ https://github.com/owner/repo
 ```
 
 The header gives enough metadata to trace matches back to a specific blob, commit, and path.
+
+When `-split=true` (default), individual per-blob files are also created:
+
+```text
+{outDir}/{safe_host}_{safe_owner}_{safe_repo}/{path/to}/{hash12}_{filename}
+{outDir}/{safe_host}_{safe_owner}_{safe_repo}/{path/to}/resolved_{hash12}_{filename}
+```
+
+Split files contain pure blob content (no metadata headers). Resolved blobs get the `resolved_` prefix. Deduplication applies: only the first occurrence of each blob hash is written.
+
+## Split output
+
+When `-split=true` (default), `gitcontent` also creates a directory of per-blob files alongside the monolithic `.txt`:
+
+```text
+{outDir}/{safe_host}_{safe_owner}_{safe_repo}/
+  path/to/abc123def456_filename.py
+  path/to/resolved_xyz789abc012_filename.py
+```
+
+- **Filename format**: `{hash12}_{original_filename}` — 12-char short SHA prefix
+- **Resolved blobs**: `resolved_{hash12}_{original_filename}` — resolved content from GitHub API
+- **Directory structure**: matches the original file path from the repository
+- **No metadata**: files contain pure blob content only (no headers)
+- **Deduplication**: first occurrence of each blob hash wins; subsequent duplicates are skipped
+- **No budget limit**: `-max-output-bytes` applies only to the monolithic `.txt`; split files are unlimited
+- **Security**: path traversal and symlink attacks are rejected and logged
 
 ## Binary filtering
 
@@ -126,6 +159,12 @@ A blob is treated as binary and skipped if any of these are true:
 ```bash
 printf '%s\n' 'https://github.com/org/repo' | gitcontent -out out
 grep -RniE '(api[_-]?key|secret|password|token)' out/
+```
+
+Search within per-file split output (path-based filtering):
+
+```bash
+find out/github-com_org_repo -name '*.py' | xargs grep -l 'password'
 ```
 
 ## Development

@@ -16,6 +16,7 @@ var (
 	flagMaxOutputBytes  = flag.Int64("max-output-bytes", 1073741824, "maximum bytes per output file before stopping repository processing")
 	flagInsecure        = flag.Bool("insecure", true, "skip TLS certificate verification")
 	flagResolveRedacted = flag.Bool("resolve-redacted", true, "resolve GitHub-redacted secrets (***REMOVED***, ***REDACTED***) via API; optionally set GITHUB_TOKEN env var for higher rate limits")
+	flagSplit           = flag.Bool("split", true, "also create individual per-blob files preserving directory structure")
 )
 
 func main() {
@@ -28,6 +29,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Example with secret redaction bypass:\n")
 		fmt.Fprintf(os.Stderr, "  export GITHUB_TOKEN=ghp_xxx\n")
 		fmt.Fprintf(os.Stderr, "  printf 'https://github.com/owner/repo' | gitcontent\n\n")
+		fmt.Fprintf(os.Stderr, "Example with split output (per-file structure):\n")
+		fmt.Fprintf(os.Stderr, "  printf 'https://github.com/owner/repo' | gitcontent\n")
+		fmt.Fprintf(os.Stderr, "  find out/github-com_owner_repo -name '*.py' | xargs grep 'password'\n\n")
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 	}
@@ -42,6 +46,7 @@ func main() {
 		insecure:        *flagInsecure,
 		resolveRedacted: *flagResolveRedacted,
 		githubToken:     os.Getenv("GITHUB_TOKEN"),
+		split:           *flagSplit,
 		l:               logger,
 	}
 
