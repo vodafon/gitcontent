@@ -447,6 +447,22 @@ func (obj *Worker) resolveRedactedViaOriginalHistory(repo *git.Repository, spec 
 			if _, writeErr := io.WriteString(output, "\n"); writeErr != nil {
 				return true, writeErr
 			}
+
+			if obj.split {
+				resolvedShortHash := originalBlobSHA[:12]
+				resolvedFileName := "resolved_" + resolvedShortHash + "_" + filepath.Base(rb.path)
+				resolvedFilePath, err := safeSplitPath(obj.splitDir, filepath.Join(filepath.Dir(rb.path), resolvedFileName))
+				if err != nil {
+					obj.log(1, "skipping resolved split file due to unsafe path", "path", rb.path, "error", err)
+				} else {
+					if err := os.MkdirAll(filepath.Dir(resolvedFilePath), os.ModePerm); err != nil {
+						return true, fmt.Errorf("create resolved split directory: %w", err)
+					}
+					if err := os.WriteFile(resolvedFilePath, content, 0644); err != nil {
+						return true, fmt.Errorf("write resolved split file: %w", err)
+					}
+				}
+			}
 		}
 	}
 
@@ -540,6 +556,22 @@ func (obj *Worker) resolveRedactedViaCurrentTreeAPI(repo *git.Repository, spec r
 			}
 			if _, err := io.WriteString(output, "\n"); err != nil {
 				return err
+			}
+
+			if obj.split {
+				resolvedShortHash := apiSHA[:12]
+				resolvedFileName := "resolved_" + resolvedShortHash + "_" + filepath.Base(rb.path)
+				resolvedFilePath, err := safeSplitPath(obj.splitDir, filepath.Join(filepath.Dir(rb.path), resolvedFileName))
+				if err != nil {
+					obj.log(1, "skipping resolved split file due to unsafe path", "path", rb.path, "error", err)
+				} else {
+					if err := os.MkdirAll(filepath.Dir(resolvedFilePath), os.ModePerm); err != nil {
+						return fmt.Errorf("create resolved split directory: %w", err)
+					}
+					if err := os.WriteFile(resolvedFilePath, content, 0644); err != nil {
+						return fmt.Errorf("write resolved split file: %w", err)
+					}
+				}
 			}
 		}
 	}

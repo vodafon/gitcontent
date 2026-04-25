@@ -1539,6 +1539,274 @@ func TestSplitMonolithicUnchanged(t *testing.T) {
 	}
 }
 
+func TestSplitResolvedFilesCreated(t *testing.T) {
+	repoDir := t.TempDir()
+	repo, err := git.PlainInit(repoDir, false)
+	if err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	filePath := filepath.Join(repoDir, "config.txt")
+	if err := os.WriteFile(filePath, []byte("token = '***REMOVED***'"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if _, err := wt.Add("config.txt"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if _, err := wt.Commit("initial", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@test.com", When: time.Now()}}); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	head, err := repo.Head()
+	if err != nil {
+		t.Fatalf("repo head: %v", err)
+	}
+	commit, err := repo.CommitObject(head.Hash())
+	if err != nil {
+		t.Fatalf("commit object: %v", err)
+	}
+	localTree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("tree: %v", err)
+	}
+	localFile, err := localTree.File("config.txt")
+	if err != nil {
+		t.Fatalf("tree file: %v", err)
+	}
+	cloneSHA := localFile.Hash.String()
+	treeSHA := commit.TreeHash.String()
+	apiSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	resolvedContent := "token = 'fake-resolved-content'\n"
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	origFetchTree := fetchTree
+	fetchTree = func(httpClient *http.Client, owner, r, tSHA, token string) (*githubTree, error) {
+		if tSHA != treeSHA {
+			t.Errorf("unexpected tree SHA: %s", tSHA)
+		}
+		return &githubTree{SHA: treeSHA, Tree: []githubTreeEntry{{Path: "config.txt", SHA: apiSHA, Type: "blob"}}}, nil
+	}
+	t.Cleanup(func() { fetchTree = origFetchTree })
+
+	origFetchBlob := fetchBlob
+	fetchBlob = func(httpClient *http.Client, owner, r, bSHA, token string) ([]byte, error) {
+		if bSHA != apiSHA {
+			t.Errorf("unexpected blob SHA: %s", bSHA)
+		}
+		return []byte(resolvedContent), nil
+	}
+	t.Cleanup(func() { fetchBlob = origFetchBlob })
+
+	outDir := t.TempDir()
+	worker := &Worker{
+		outDir:          outDir,
+		verbose:         1,
+		maxCloneSeconds: 300,
+		maxOutputBytes:  1024 * 1024,
+		resolveRedacted: true,
+		split:           true,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	if err := worker.Repo("https://github.com/test/testrepo"); err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+
+	splitDir := findSplitDir(t, outDir)
+	redactedSplitPath := filepath.Join(splitDir, cloneSHA[:12]+"_config.txt")
+	resolvedSplitPath := filepath.Join(splitDir, "resolved_"+apiSHA[:12]+"_config.txt")
+
+	redactedSplit, err := os.ReadFile(redactedSplitPath)
+	if err != nil {
+		t.Fatalf("read redacted split file: %v", err)
+	}
+	if !strings.Contains(string(redactedSplit), "***REMOVED***") {
+		t.Fatalf("redacted split file should contain original marker, got %q", string(redactedSplit))
+	}
+
+	resolvedSplit, err := os.ReadFile(resolvedSplitPath)
+	if err != nil {
+		t.Fatalf("read resolved split file: %v", err)
+	}
+	if string(resolvedSplit) != resolvedContent {
+		t.Fatalf("resolved split file content mismatch: got %q want %q", string(resolvedSplit), resolvedContent)
+	}
+	if strings.Contains(string(resolvedSplit), "==== Blob") {
+		t.Fatalf("resolved split file should contain pure content only, got %q", string(resolvedSplit))
+	}
+}
+
+func TestSplitResolvedDisabled(t *testing.T) {
+	repoDir := t.TempDir()
+	repo, err := git.PlainInit(repoDir, false)
+	if err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	filePath := filepath.Join(repoDir, "config.txt")
+	if err := os.WriteFile(filePath, []byte("token = '***REMOVED***'"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if _, err := wt.Add("config.txt"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if _, err := wt.Commit("initial", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@test.com", When: time.Now()}}); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	head, err := repo.Head()
+	if err != nil {
+		t.Fatalf("repo head: %v", err)
+	}
+	commit, err := repo.CommitObject(head.Hash())
+	if err != nil {
+		t.Fatalf("commit object: %v", err)
+	}
+	treeSHA := commit.TreeHash.String()
+	apiSHA := "dddddddddddddddddddddddddddddddddddddddd"
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	origFetchTree := fetchTree
+	fetchTree = func(httpClient *http.Client, owner, r, tSHA, token string) (*githubTree, error) {
+		if tSHA != treeSHA {
+			t.Errorf("unexpected tree SHA: %s", tSHA)
+		}
+		return &githubTree{SHA: treeSHA, Tree: []githubTreeEntry{{Path: "config.txt", SHA: apiSHA, Type: "blob"}}}, nil
+	}
+	t.Cleanup(func() { fetchTree = origFetchTree })
+
+	origFetchBlob := fetchBlob
+	fetchBlob = func(httpClient *http.Client, owner, r, bSHA, token string) ([]byte, error) {
+		return []byte("token = 'fake-resolved-content'\n"), nil
+	}
+	t.Cleanup(func() { fetchBlob = origFetchBlob })
+
+	outDir := t.TempDir()
+	worker := &Worker{
+		outDir:          outDir,
+		verbose:         1,
+		maxCloneSeconds: 300,
+		maxOutputBytes:  1024 * 1024,
+		resolveRedacted: true,
+		split:           false,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	if err := worker.Repo("https://github.com/test/testrepo"); err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("read out dir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].IsDir() || !strings.HasSuffix(entries[0].Name(), "_content.txt") {
+		t.Fatalf("expected only monolithic output file when split disabled, got %+v", entries)
+	}
+}
+
+func TestSplitResolvedNestedPath(t *testing.T) {
+	repoDir := t.TempDir()
+	repo, err := git.PlainInit(repoDir, false)
+	if err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoDir, "config"), os.ModePerm); err != nil {
+		t.Fatalf("mkdir config: %v", err)
+	}
+	filePath := filepath.Join(repoDir, "config", "secrets.txt")
+	if err := os.WriteFile(filePath, []byte("token = '***REMOVED***'"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if _, err := wt.Add("config/secrets.txt"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if _, err := wt.Commit("initial", &git.CommitOptions{Author: &object.Signature{Name: "test", Email: "test@test.com", When: time.Now()}}); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	head, err := repo.Head()
+	if err != nil {
+		t.Fatalf("repo head: %v", err)
+	}
+	commit, err := repo.CommitObject(head.Hash())
+	if err != nil {
+		t.Fatalf("commit object: %v", err)
+	}
+	treeSHA := commit.TreeHash.String()
+	apiSHA := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	resolvedContent := "token = 'nested-resolved'\n"
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	origFetchTree := fetchTree
+	fetchTree = func(httpClient *http.Client, owner, r, tSHA, token string) (*githubTree, error) {
+		if tSHA != treeSHA {
+			t.Errorf("unexpected tree SHA: %s", tSHA)
+		}
+		return &githubTree{SHA: treeSHA, Tree: []githubTreeEntry{{Path: "config/secrets.txt", SHA: apiSHA, Type: "blob"}}}, nil
+	}
+	t.Cleanup(func() { fetchTree = origFetchTree })
+
+	origFetchBlob := fetchBlob
+	fetchBlob = func(httpClient *http.Client, owner, r, bSHA, token string) ([]byte, error) {
+		if bSHA != apiSHA {
+			t.Errorf("unexpected blob SHA: %s", bSHA)
+		}
+		return []byte(resolvedContent), nil
+	}
+	t.Cleanup(func() { fetchBlob = origFetchBlob })
+
+	outDir := t.TempDir()
+	worker := &Worker{
+		outDir:          outDir,
+		verbose:         1,
+		maxCloneSeconds: 300,
+		maxOutputBytes:  1024 * 1024,
+		resolveRedacted: true,
+		split:           true,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	if err := worker.Repo("https://github.com/test/testrepo"); err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+
+	splitDir := findSplitDir(t, outDir)
+	resolvedSplitPath := filepath.Join(splitDir, "config", "resolved_"+apiSHA[:12]+"_secrets.txt")
+	resolvedSplit, err := os.ReadFile(resolvedSplitPath)
+	if err != nil {
+		t.Fatalf("read nested resolved split file: %v", err)
+	}
+	if string(resolvedSplit) != resolvedContent {
+		t.Fatalf("nested resolved split file content mismatch: got %q want %q", string(resolvedSplit), resolvedContent)
+	}
+}
+
 func TestSafeSplitPath(t *testing.T) {
 	// Test non-filesystem cases with table-driven approach
 	tests := []struct {
