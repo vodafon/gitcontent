@@ -16,6 +16,125 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
+func createRepoWithFiles(t *testing.T, files map[string]string) (*git.Repository, map[string]string, string) {
+	t.Helper()
+
+	repoDir := t.TempDir()
+	repo, err := git.PlainInit(repoDir, false)
+	if err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+
+	for path, content := range files {
+		fullPath := filepath.Join(repoDir, path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), os.ModePerm); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+			t.Fatalf("write file %s: %v", path, err)
+		}
+		if _, err := wt.Add(path); err != nil {
+			t.Fatalf("git add %s: %v", path, err)
+		}
+	}
+
+	commitHash, err := wt.Commit("initial", &git.CommitOptions{
+		Author: &object.Signature{Name: "test", Email: "test@test.com", When: time.Now()},
+	})
+	if err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	commitObj, err := repo.CommitObject(commitHash)
+	if err != nil {
+		t.Fatalf("commit object: %v", err)
+	}
+	tree, err := commitObj.Tree()
+	if err != nil {
+		t.Fatalf("commit tree: %v", err)
+	}
+
+	hashes := make(map[string]string)
+	err = tree.Files().ForEach(func(f *object.File) error {
+		hashes[f.Name] = f.Hash.String()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("iterate files: %v", err)
+	}
+
+	return repo, hashes, commitHash.String()
+}
+
+func findMonolithicOutputFile(t *testing.T, outDir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("read out dir: %v", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), "_content.txt") {
+			return filepath.Join(outDir, entry.Name())
+		}
+	}
+	t.Fatalf("monolithic output file not found in %s", outDir)
+	return ""
+}
+
+func findSplitDir(t *testing.T, outDir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("read out dir: %v", err)
+	}
+
+	var splitDir string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			if splitDir != "" {
+				t.Fatalf("multiple split directories found in %s", outDir)
+			}
+			splitDir = filepath.Join(outDir, entry.Name())
+		}
+	}
+
+	if splitDir == "" {
+		t.Fatalf("split directory not found in %s", outDir)
+	}
+
+	return splitDir
+}
+
+func listRegularFiles(t *testing.T, root string) []string {
+	t.Helper()
+
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		files = append(files, rel)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk files in %s: %v", root, err)
+	}
+
+	return files
+}
+
 func TestParseRepoInput(t *testing.T) {
 	t.Parallel()
 
@@ -1152,4 +1271,376 @@ func TestEdgeRedactedBlobsResetPerRepo(t *testing.T) {
 	if fetchTreeCalls != 1 {
 		t.Fatalf("expected fetchTree called only for first repo, got %d", fetchTreeCalls)
 	}
+}
+
+func TestSplitFilesCreated(t *testing.T) {
+	repo, hashes, commitHash := createRepoWithFiles(t, map[string]string{
+		"main.go":         "package main\n",
+		"docs/readme.txt": "hello split\n",
+	})
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	outDir := t.TempDir()
+	worker := &Worker{
+		outDir:          outDir,
+		verbose:         1,
+		maxCloneSeconds: 300,
+		maxOutputBytes:  1024 * 1024,
+		split:           true,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	if err := worker.Repo("https://github.com/test/repo"); err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+
+	splitDir := findSplitDir(t, outDir)
+	for path, content := range map[string]string{"main.go": "package main\n", "docs/readme.txt": "hello split\n"} {
+		shortHash := hashes[path][:12]
+		splitName := shortHash + "_" + filepath.Base(path)
+		splitPath := filepath.Join(splitDir, filepath.Join(filepath.Dir(path), splitName))
+
+		got, err := os.ReadFile(splitPath)
+		if err != nil {
+			t.Fatalf("read split file %s: %v", splitPath, err)
+		}
+		if string(got) != content {
+			t.Fatalf("split content mismatch for %s: got %q want %q", splitPath, string(got), content)
+		}
+	}
+
+	monolithicPath := findMonolithicOutputFile(t, outDir)
+	monolithic, err := os.ReadFile(monolithicPath)
+	if err != nil {
+		t.Fatalf("read monolithic output: %v", err)
+	}
+	out := string(monolithic)
+	if !strings.Contains(out, "==== Blob "+hashes["main.go"]+" | Commit "+commitHash+" | Path main.go ====") {
+		t.Fatalf("monolithic output missing main.go header: %s", out)
+	}
+	if !strings.Contains(out, "==== Blob "+hashes["docs/readme.txt"]+" | Commit "+commitHash+" | Path docs/readme.txt ====") {
+		t.Fatalf("monolithic output missing docs/readme.txt header: %s", out)
+	}
+}
+
+func TestSplitDisabled(t *testing.T) {
+	repo, hashes, commitHash := createRepoWithFiles(t, map[string]string{"file.txt": "content\n"})
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	outDir := t.TempDir()
+	worker := &Worker{
+		outDir:          outDir,
+		verbose:         1,
+		maxCloneSeconds: 300,
+		maxOutputBytes:  1024 * 1024,
+		split:           false,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	if err := worker.Repo("https://github.com/test/repo"); err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatalf("read out dir: %v", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			t.Fatalf("split directory should not exist when split is disabled: %s", entry.Name())
+		}
+	}
+
+	monolithicPath := findMonolithicOutputFile(t, outDir)
+	monolithic, err := os.ReadFile(monolithicPath)
+	if err != nil {
+		t.Fatalf("read monolithic output: %v", err)
+	}
+	expected := "==== Blob " + hashes["file.txt"] + " | Commit " + commitHash + " | Path file.txt ===="
+	if !strings.Contains(string(monolithic), expected) {
+		t.Fatalf("monolithic output missing expected section: %s", string(monolithic))
+	}
+}
+
+func TestSplitDedup(t *testing.T) {
+	repo, hashes, _ := createRepoWithFiles(t, map[string]string{
+		"src/first.txt":  "same-content\n",
+		"src/second.txt": "same-content\n",
+	})
+
+	if hashes["src/first.txt"] != hashes["src/second.txt"] {
+		t.Fatal("test setup requires identical blob hashes")
+	}
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	outDir := t.TempDir()
+	worker := &Worker{
+		outDir:          outDir,
+		verbose:         1,
+		maxCloneSeconds: 300,
+		maxOutputBytes:  1024 * 1024,
+		split:           true,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	if err := worker.Repo("https://github.com/test/repo"); err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+
+	splitDir := findSplitDir(t, outDir)
+	files := listRegularFiles(t, splitDir)
+	if len(files) != 1 {
+		t.Fatalf("expected exactly one split file for dedup, got %d (%v)", len(files), files)
+	}
+
+	shortHash := hashes["src/first.txt"][:12]
+	expectedFirst := filepath.Join("src", shortHash+"_first.txt")
+	if files[0] != expectedFirst {
+		t.Fatalf("expected first-path split file %s, got %s", expectedFirst, files[0])
+	}
+
+	unexpectedSecond := filepath.Join(splitDir, "src", shortHash+"_second.txt")
+	if _, err := os.Stat(unexpectedSecond); !os.IsNotExist(err) {
+		t.Fatalf("expected second-path split file to be absent, stat err: %v", err)
+	}
+}
+
+func TestSplitNestedDirs(t *testing.T) {
+	repo, hashes, _ := createRepoWithFiles(t, map[string]string{"src/app/config.py": "value = 1\n"})
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	outDir := t.TempDir()
+	worker := &Worker{
+		outDir:          outDir,
+		verbose:         1,
+		maxCloneSeconds: 300,
+		maxOutputBytes:  1024 * 1024,
+		split:           true,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	if err := worker.Repo("https://github.com/test/repo"); err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+
+	splitDir := findSplitDir(t, outDir)
+	shortHash := hashes["src/app/config.py"][:12]
+	expectedPath := filepath.Join(splitDir, "src", "app", shortHash+"_config.py")
+
+	content, err := os.ReadFile(expectedPath)
+	if err != nil {
+		t.Fatalf("read nested split file: %v", err)
+	}
+	if string(content) != "value = 1\n" {
+		t.Fatalf("nested split file should contain pure blob content, got %q", string(content))
+	}
+}
+
+func TestSplitDirCleanup(t *testing.T) {
+	repoOne, hashesOne, _ := createRepoWithFiles(t, map[string]string{"first.txt": "first\n"})
+	repoTwo, hashesTwo, _ := createRepoWithFiles(t, map[string]string{"second.txt": "second\n"})
+
+	repos := []*git.Repository{repoOne, repoTwo}
+	idx := 0
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		repo := repos[idx]
+		idx++
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	outDir := t.TempDir()
+	worker := &Worker{
+		outDir:          outDir,
+		verbose:         1,
+		maxCloneSeconds: 300,
+		maxOutputBytes:  1024 * 1024,
+		split:           true,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	if err := worker.Repo("https://github.com/test/repo"); err != nil {
+		t.Fatalf("first worker.Repo: %v", err)
+	}
+	if err := worker.Repo("https://github.com/test/repo"); err != nil {
+		t.Fatalf("second worker.Repo: %v", err)
+	}
+
+	splitDir := findSplitDir(t, outDir)
+	remainingFiles := listRegularFiles(t, splitDir)
+	if len(remainingFiles) != 1 {
+		t.Fatalf("expected exactly one split file after cleanup, got %d (%v)", len(remainingFiles), remainingFiles)
+	}
+
+	firstPath := filepath.Join(splitDir, hashesOne["first.txt"][:12]+"_first.txt")
+	if _, err := os.Stat(firstPath); !os.IsNotExist(err) {
+		t.Fatalf("expected first run split file to be removed, stat err: %v", err)
+	}
+
+	secondPath := filepath.Join(splitDir, hashesTwo["second.txt"][:12]+"_second.txt")
+	if _, err := os.Stat(secondPath); err != nil {
+		t.Fatalf("expected second run split file to exist, stat err: %v", err)
+	}
+}
+
+func TestSplitMonolithicUnchanged(t *testing.T) {
+	repo, hashes, commitHash := createRepoWithFiles(t, map[string]string{"src/config.yaml": "enabled: true\n"})
+
+	origClone := plainCloneContext
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return repo, nil
+	}
+	t.Cleanup(func() { plainCloneContext = origClone })
+
+	outDir := t.TempDir()
+	worker := &Worker{
+		outDir:          outDir,
+		verbose:         1,
+		maxCloneSeconds: 300,
+		maxOutputBytes:  1024 * 1024,
+		split:           true,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	if err := worker.Repo("https://github.com/test/repo"); err != nil {
+		t.Fatalf("worker.Repo: %v", err)
+	}
+
+	monolithicPath := findMonolithicOutputFile(t, outDir)
+	monolithic, err := os.ReadFile(monolithicPath)
+	if err != nil {
+		t.Fatalf("read monolithic output: %v", err)
+	}
+
+	expectedSection := fmt.Sprintf("==== Blob %s | Commit %s | Path src/config.yaml ====\nenabled: true\n", hashes["src/config.yaml"], commitHash)
+	if !strings.Contains(string(monolithic), expectedSection) {
+		t.Fatalf("monolithic format changed unexpectedly; missing section %q in %s", expectedSection, string(monolithic))
+	}
+}
+
+func TestSafeSplitPath(t *testing.T) {
+	// Test non-filesystem cases with table-driven approach
+	tests := []struct {
+		name       string
+		splitDir   string
+		blobPath   string
+		wantErr    bool
+		wantErrMsg string
+	}{
+		{
+			name:     "normal path",
+			splitDir: "/tmp/split",
+			blobPath: "src/app/config.py",
+			wantErr:  false,
+		},
+		{
+			name:       "traversal with ..",
+			splitDir:   "/tmp/split",
+			blobPath:   "../../etc/passwd",
+			wantErr:    true,
+			wantErrMsg: "path escapes split directory",
+		},
+		{
+			name:       "traversal mixed",
+			splitDir:   "/tmp/split",
+			blobPath:   "src/../../etc/passwd",
+			wantErr:    true,
+			wantErrMsg: "path escapes split directory",
+		},
+		{
+			name:     "clean path with ./",
+			splitDir: "/tmp/split",
+			blobPath: "./src/app/config.py",
+			wantErr:  false,
+		},
+		{
+			name:       "empty path",
+			splitDir:   "/tmp/split",
+			blobPath:   "",
+			wantErr:    true,
+			wantErrMsg: "empty blob path",
+		},
+		{
+			name:     "absolute path treated as relative",
+			splitDir: "/tmp/split",
+			blobPath: "/etc/passwd",
+			wantErr:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path, err := safeSplitPath(tt.splitDir, tt.blobPath)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q + %q, got success with path %q", tt.splitDir, tt.blobPath, path)
+				}
+				if tt.wantErrMsg != "" && !strings.Contains(err.Error(), tt.wantErrMsg) {
+					t.Fatalf("expected error containing %q, got: %v", tt.wantErrMsg, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %q + %q: %v", tt.splitDir, tt.blobPath, err)
+			}
+			if path == "" {
+				t.Fatalf("expected non-empty path for %q + %q", tt.splitDir, tt.blobPath)
+			}
+		})
+	}
+
+	// Test symlink detection with filesystem
+	t.Run("symlink component", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		// Create subdirectory
+		subDir := filepath.Join(tmpDir, "subdir")
+		if err := os.Mkdir(subDir, 0755); err != nil {
+			t.Fatalf("failed to create subdir: %v", err)
+		}
+
+		// Create target file outside tmpDir
+		targetFile := filepath.Join(t.TempDir(), "target.txt")
+		if err := os.WriteFile(targetFile, []byte("target"), 0644); err != nil {
+			t.Fatalf("failed to create target file: %v", err)
+		}
+
+		// Create symlink inside subdir pointing outside
+		linkPath := filepath.Join(subDir, "link")
+		if err := os.Symlink(targetFile, linkPath); err != nil {
+			t.Fatalf("failed to create symlink: %v", err)
+		}
+
+		// Try to access symlink component
+		_, err := safeSplitPath(tmpDir, "subdir/link")
+		if err == nil {
+			t.Fatal("expected error when accessing symlink component")
+		}
+		if !strings.Contains(err.Error(), "symlink in path component") {
+			t.Fatalf("expected 'symlink in path component' error, got: %v", err)
+		}
+	})
 }

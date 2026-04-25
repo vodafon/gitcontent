@@ -38,6 +38,8 @@ type Worker struct {
 	l               *slog.Logger
 	resolveRedacted bool
 	githubToken     string
+	split           bool
+	splitDir        string
 	redactedBlobs   []redactedBlob
 }
 
@@ -86,6 +88,15 @@ func (obj *Worker) Repo(repoInput string) error {
 	}
 
 	outputPath := filepath.Join(obj.outDir, spec.SafeName+"_content.txt")
+	if obj.split {
+		obj.splitDir = filepath.Join(obj.outDir, spec.SafeName)
+		if err := os.RemoveAll(obj.splitDir); err != nil {
+			return fmt.Errorf("remove split directory: %w", err)
+		}
+		if err := os.MkdirAll(obj.splitDir, os.ModePerm); err != nil {
+			return fmt.Errorf("create split directory: %w", err)
+		}
+	}
 	file, err := os.Create(outputPath)
 	if err != nil {
 		return fmt.Errorf("create output file: %w", err)
@@ -271,6 +282,22 @@ func (obj *Worker) saveCommitFiles(commit *object.Commit, output io.Writer, proc
 		}
 		if _, err := io.WriteString(output, "\n"); err != nil {
 			return err
+		}
+
+		if obj.split {
+			shortHash := blobHash[:12]
+			splitFileName := shortHash + "_" + filepath.Base(f.Name)
+			splitFilePath, err := safeSplitPath(obj.splitDir, filepath.Join(filepath.Dir(f.Name), splitFileName))
+			if err != nil {
+				obj.log(1, "skipping split file due to unsafe path", "path", f.Name, "error", err)
+			} else {
+				if err := os.MkdirAll(filepath.Dir(splitFilePath), os.ModePerm); err != nil {
+					return fmt.Errorf("create split directory: %w", err)
+				}
+				if err := os.WriteFile(splitFilePath, content, 0644); err != nil {
+					return fmt.Errorf("write split file: %w", err)
+				}
+			}
 		}
 
 		processedBlobs[blobHash] = true
@@ -617,6 +644,47 @@ func isBinary(content []byte) bool {
 	}
 
 	return float64(control)/float64(len(content)) > 0.3
+}
+
+// safeSplitPath validates that joining splitDir and blobPath produces a path that
+// stays within splitDir and contains no symlink components.
+// Returns the clean absolute path on success, or an error if the path would escape
+// or if any existing component is a symlink.
+func safeSplitPath(splitDir, blobPath string) (string, error) {
+	if blobPath == "" {
+		return "", fmt.Errorf("empty blob path")
+	}
+	cleanDir := filepath.Clean(splitDir) + string(os.PathSeparator)
+	full := filepath.Clean(filepath.Join(splitDir, blobPath))
+	if !strings.HasPrefix(full, cleanDir) {
+		return "", fmt.Errorf("path escapes split directory: %q", blobPath)
+	}
+	// Check each existing path component for symlinks
+	// Only check components under splitDir (the blobPath portion)
+	rel, err := filepath.Rel(filepath.Clean(splitDir), full)
+	if err != nil {
+		return "", fmt.Errorf("failed to compute relative path: %w", err)
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	current := filepath.Clean(splitDir)
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Component doesn't exist yet — safe (will be created by MkdirAll)
+				break
+			}
+			return "", fmt.Errorf("lstat %q: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("symlink in path component: %q", current)
+		}
+	}
+	return full, nil
 }
 
 func parseRepoInput(repoInput string) (repoSpec, error) {
