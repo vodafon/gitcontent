@@ -273,7 +273,7 @@ func (obj *Worker) saveCommitFiles(commit *object.Commit, output io.Writer, proc
 			})
 		}
 
-		header := fmt.Sprintf("\n==== Blob %s | Commit %s | Path %s ====\n", blobHash, commit.Hash.String(), f.Name)
+		header := fmt.Sprintf("\n==== Author %s | Blob %s | Commit %s | Path %s ====\n", commit.Author.Email, blobHash, commit.Hash.String(), f.Name)
 		if _, err := io.WriteString(output, header); err != nil {
 			return err
 		}
@@ -437,7 +437,7 @@ func (obj *Worker) resolveRedactedViaOriginalHistory(repo *git.Repository, spec 
 				content = readContent
 			}
 
-			header := fmt.Sprintf("\n==== Blob %s | Commit %s | Path %s | Resolved ====\n", originalBlobSHA, rb.commitHash, rb.path)
+			header := fmt.Sprintf("\n==== Author %s | Blob %s | Commit %s | Path %s | Resolved ====\n", cloneCommit.Author.Email, originalBlobSHA, rb.commitHash, rb.path)
 			if _, writeErr := io.WriteString(output, header); writeErr != nil {
 				return true, writeErr
 			}
@@ -547,7 +547,7 @@ func (obj *Worker) resolveRedactedViaCurrentTreeAPI(repo *git.Repository, spec r
 				content = fetched
 			}
 
-			header := fmt.Sprintf("\n==== Blob %s | Commit %s | Path %s | Resolved ====\n", apiSHA, rb.commitHash, rb.path)
+			header := fmt.Sprintf("\n==== Author %s | Blob %s | Commit %s | Path %s | Resolved ====\n", commit.Author.Email, apiSHA, rb.commitHash, rb.path)
 			if _, err := io.WriteString(output, header); err != nil {
 				return err
 			}

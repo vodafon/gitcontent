@@ -96,14 +96,14 @@ The file format is:
 ```text
 https://github.com/owner/repo
 
-==== Blob <blobHash> | Commit <commitHash> | Path <path> ====
+==== Author <authorEmail> | Blob <blobHash> | Commit <commitHash> | Path <path> ====
 <file content>
 
-==== Blob <blobHash> | Commit <commitHash> | Path <path> ====
+==== Author <authorEmail> | Blob <blobHash> | Commit <commitHash> | Path <path> ====
 <file content>
 ```
 
-The header gives enough metadata to trace matches back to a specific blob, commit, and path.
+The header gives enough metadata to trace matches back to a specific author, blob, commit, and path.
 
 When `-split=true` (default), individual per-blob files are also created:
 

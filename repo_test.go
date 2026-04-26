@@ -1120,10 +1120,10 @@ func TestEdgeBlobAPIPartialFailure(t *testing.T) {
 		t.Fatalf("read output: %v", err)
 	}
 	output := string(outputBytes)
-	if strings.Contains(output, fmt.Sprintf("==== Blob %s | Commit %s | Path first.txt | Resolved ====", apiFirstSHA, worker.redactedBlobs[0].commitHash)) {
+	if strings.Contains(output, fmt.Sprintf("==== Author t@t.com | Blob %s | Commit %s | Path first.txt | Resolved ====", apiFirstSHA, worker.redactedBlobs[0].commitHash)) {
 		t.Fatalf("first blob should not resolve after blob API failure: %s", output)
 	}
-	if !strings.Contains(output, "==== Blob "+apiSecondSHA) || !strings.Contains(output, "Path second.txt | Resolved") || !strings.Contains(output, "resolved-content") {
+	if !strings.Contains(output, "==== Author t@t.com | Blob "+apiSecondSHA) || !strings.Contains(output, "Path second.txt | Resolved") || !strings.Contains(output, "resolved-content") {
 		t.Fatalf("second blob should resolve successfully: %s", output)
 	}
 }
@@ -1320,10 +1320,10 @@ func TestSplitFilesCreated(t *testing.T) {
 		t.Fatalf("read monolithic output: %v", err)
 	}
 	out := string(monolithic)
-	if !strings.Contains(out, "==== Blob "+hashes["main.go"]+" | Commit "+commitHash+" | Path main.go ====") {
+	if !strings.Contains(out, "==== Author test@test.com | Blob "+hashes["main.go"]+" | Commit "+commitHash+" | Path main.go ====") {
 		t.Fatalf("monolithic output missing main.go header: %s", out)
 	}
-	if !strings.Contains(out, "==== Blob "+hashes["docs/readme.txt"]+" | Commit "+commitHash+" | Path docs/readme.txt ====") {
+	if !strings.Contains(out, "==== Author test@test.com | Blob "+hashes["docs/readme.txt"]+" | Commit "+commitHash+" | Path docs/readme.txt ====") {
 		t.Fatalf("monolithic output missing docs/readme.txt header: %s", out)
 	}
 }
@@ -1366,7 +1366,7 @@ func TestSplitDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read monolithic output: %v", err)
 	}
-	expected := "==== Blob " + hashes["file.txt"] + " | Commit " + commitHash + " | Path file.txt ===="
+	expected := "==== Author test@test.com | Blob " + hashes["file.txt"] + " | Commit " + commitHash + " | Path file.txt ===="
 	if !strings.Contains(string(monolithic), expected) {
 		t.Fatalf("monolithic output missing expected section: %s", string(monolithic))
 	}
@@ -1533,7 +1533,7 @@ func TestSplitMonolithicUnchanged(t *testing.T) {
 		t.Fatalf("read monolithic output: %v", err)
 	}
 
-	expectedSection := fmt.Sprintf("==== Blob %s | Commit %s | Path src/config.yaml ====\nenabled: true\n", hashes["src/config.yaml"], commitHash)
+	expectedSection := fmt.Sprintf("==== Author test@test.com | Blob %s | Commit %s | Path src/config.yaml ====\nenabled: true\n", hashes["src/config.yaml"], commitHash)
 	if !strings.Contains(string(monolithic), expectedSection) {
 		t.Fatalf("monolithic format changed unexpectedly; missing section %q in %s", expectedSection, string(monolithic))
 	}
@@ -1647,7 +1647,7 @@ func TestSplitResolvedFilesCreated(t *testing.T) {
 	if string(resolvedSplit) != resolvedContent {
 		t.Fatalf("resolved split file content mismatch: got %q want %q", string(resolvedSplit), resolvedContent)
 	}
-	if strings.Contains(string(resolvedSplit), "==== Blob") {
+	if strings.Contains(string(resolvedSplit), "==== Author") {
 		t.Fatalf("resolved split file should contain pure content only, got %q", string(resolvedSplit))
 	}
 }
