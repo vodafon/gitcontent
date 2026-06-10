@@ -21,6 +21,7 @@ import (
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/storage/memory"
 )
 
 type redactedBlob struct {
@@ -54,7 +55,19 @@ type repoSpec struct {
 var (
 	plainCloneContext = git.PlainCloneContext
 	makeTempDir       = os.MkdirTemp
+	listRemoteRefs    = defaultListRemoteRefs
 )
+
+// defaultListRemoteRefs lists the references advertised by a remote without
+// cloning it. It is used to recover the default branch when the remote does
+// not advertise a resolvable HEAD.
+func defaultListRemoteRefs(ctx context.Context, repoURL string, insecure bool) ([]*plumbing.Reference, error) {
+	remote := git.NewRemote(memory.NewStorage(), &config.RemoteConfig{
+		Name: "origin",
+		URLs: []string{repoURL},
+	})
+	return remote.ListContext(ctx, &git.ListOptions{InsecureSkipTLS: insecure})
+}
 
 func (obj *Worker) Repo(repoInput string) error {
 	spec, err := parseRepoInput(repoInput)
@@ -144,6 +157,37 @@ func (obj *Worker) cloneRepo(repoURL, repoDir string) (*git.Repository, error) {
 		defer cancel()
 	}
 
+	repo, err := plainCloneContext(ctx, repoDir, false, obj.cloneOptions(repoURL, ""))
+	if err == nil {
+		return repo, nil
+	}
+	if !errors.Is(err, plumbing.ErrReferenceNotFound) {
+		return nil, err
+	}
+
+	// Some servers do not advertise a resolvable HEAD symref, so go-git
+	// cannot determine the default branch and clone fails with
+	// ErrReferenceNotFound even though the objects transfer fine. Recover
+	// by listing the remote references and retrying with an explicit one.
+	obj.log(2, "clone could not resolve default branch; resolving reference from remote", "repo", repoURL)
+
+	refName, resolveErr := obj.resolveDefaultBranch(ctx, repoURL)
+	if resolveErr != nil {
+		return nil, fmt.Errorf("resolve default branch after clone error %q: %w", err.Error(), resolveErr)
+	}
+
+	obj.log(2, "retrying clone with explicit reference", "repo", repoURL, "ref", refName.String())
+
+	if removeErr := os.RemoveAll(repoDir); removeErr != nil {
+		return nil, fmt.Errorf("clean clone directory before retry: %w", removeErr)
+	}
+
+	return plainCloneContext(ctx, repoDir, false, obj.cloneOptions(repoURL, refName))
+}
+
+// cloneOptions builds the clone options. When ref is empty go-git defaults to
+// the remote HEAD; otherwise the given reference is used as the clone target.
+func (obj *Worker) cloneOptions(repoURL string, ref plumbing.ReferenceName) *git.CloneOptions {
 	cloneOpts := &git.CloneOptions{
 		URL:               repoURL,
 		Progress:          os.Stdout,
@@ -153,11 +197,52 @@ func (obj *Worker) cloneRepo(repoURL, repoDir string) (*git.Repository, error) {
 		RecurseSubmodules: git.NoRecurseSubmodules,
 	}
 
+	if ref != "" {
+		cloneOpts.ReferenceName = ref
+	}
+
 	if obj.insecure {
 		cloneOpts.InsecureSkipTLS = true
 	}
 
-	return plainCloneContext(ctx, repoDir, false, cloneOpts)
+	return cloneOpts
+}
+
+// resolveDefaultBranch lists the remote references and picks a branch to clone
+// when the remote did not advertise a resolvable HEAD.
+func (obj *Worker) resolveDefaultBranch(ctx context.Context, repoURL string) (plumbing.ReferenceName, error) {
+	refs, err := listRemoteRefs(ctx, repoURL, obj.insecure)
+	if err != nil {
+		return "", fmt.Errorf("list remote references: %w", err)
+	}
+	return selectDefaultBranch(refs)
+}
+
+// selectDefaultBranch chooses a branch reference from the advertised refs,
+// preferring the branch the remote HEAD points at and otherwise falling back
+// to the first advertised branch.
+func selectDefaultBranch(refs []*plumbing.Reference) (plumbing.ReferenceName, error) {
+	for _, ref := range refs {
+		if ref == nil {
+			continue
+		}
+		if ref.Name() == plumbing.HEAD && ref.Type() == plumbing.SymbolicReference {
+			if target := ref.Target(); target.IsBranch() {
+				return target, nil
+			}
+		}
+	}
+
+	for _, ref := range refs {
+		if ref == nil {
+			continue
+		}
+		if ref.Name().IsBranch() {
+			return ref.Name(), nil
+		}
+	}
+
+	return "", errors.New("no branch references advertised by remote")
 }
 
 func (obj *Worker) processAllRefs(repo *git.Repository, output io.Writer) error {

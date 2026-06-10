@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
@@ -313,6 +314,137 @@ func TestWorkerRepoCloneTimeoutSkipsAndCleansTempDir(t *testing.T) {
 
 	if _, err := os.Stat(tempPath); !os.IsNotExist(err) {
 		t.Fatalf("expected temp clone dir cleanup, stat err: %v", err)
+	}
+}
+
+func TestSelectDefaultBranch(t *testing.T) {
+	headTarget := plumbing.ReferenceName("refs/heads/develop")
+	firstBranch := plumbing.ReferenceName("refs/heads/master")
+
+	t.Run("prefers remote HEAD target", func(t *testing.T) {
+		refs := []*plumbing.Reference{
+			plumbing.NewHashReference(firstBranch, plumbing.ZeroHash),
+			plumbing.NewSymbolicReference(plumbing.HEAD, headTarget),
+			plumbing.NewHashReference(headTarget, plumbing.ZeroHash),
+		}
+		got, err := selectDefaultBranch(refs)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != headTarget {
+			t.Fatalf("expected %q, got %q", headTarget, got)
+		}
+	})
+
+	t.Run("falls back to first branch when no HEAD advertised", func(t *testing.T) {
+		refs := []*plumbing.Reference{
+			plumbing.NewHashReference(plumbing.ReferenceName("refs/tags/v1"), plumbing.ZeroHash),
+			plumbing.NewHashReference(firstBranch, plumbing.ZeroHash),
+		}
+		got, err := selectDefaultBranch(refs)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != firstBranch {
+			t.Fatalf("expected %q, got %q", firstBranch, got)
+		}
+	})
+
+	t.Run("errors when no branch advertised", func(t *testing.T) {
+		refs := []*plumbing.Reference{
+			plumbing.NewHashReference(plumbing.ReferenceName("refs/tags/v1"), plumbing.ZeroHash),
+		}
+		if _, err := selectDefaultBranch(refs); err == nil {
+			t.Fatal("expected error for refs without a branch")
+		}
+	})
+}
+
+func TestCloneRepoRetriesWhenHeadNotResolvable(t *testing.T) {
+	oldClone := plainCloneContext
+	oldList := listRemoteRefs
+	t.Cleanup(func() {
+		plainCloneContext = oldClone
+		listRemoteRefs = oldList
+	})
+
+	resultRepo, err := git.PlainInit(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+
+	branch := plumbing.ReferenceName("refs/heads/master")
+	var attempts int
+	var secondRef plumbing.ReferenceName
+
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		attempts++
+		if attempts == 1 {
+			if o.ReferenceName != "" {
+				t.Fatalf("first attempt should use default HEAD, got %q", o.ReferenceName)
+			}
+			return nil, plumbing.ErrReferenceNotFound
+		}
+		secondRef = o.ReferenceName
+		return resultRepo, nil
+	}
+
+	listRemoteRefs = func(ctx context.Context, repoURL string, insecure bool) ([]*plumbing.Reference, error) {
+		return []*plumbing.Reference{
+			plumbing.NewHashReference(branch, plumbing.ZeroHash),
+		}, nil
+	}
+
+	worker := &Worker{
+		maxCloneSeconds: 300,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	repo, err := worker.cloneRepo("https://example.test/owner/repo", filepath.Join(t.TempDir(), "clone"))
+	if err != nil {
+		t.Fatalf("expected retry to succeed, got: %v", err)
+	}
+	if repo != resultRepo {
+		t.Fatal("expected repo from retry clone")
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 clone attempts, got %d", attempts)
+	}
+	if secondRef != branch {
+		t.Fatalf("expected retry with %q, got %q", branch, secondRef)
+	}
+}
+
+func TestCloneRepoReturnsNonReferenceErrors(t *testing.T) {
+	oldClone := plainCloneContext
+	oldList := listRemoteRefs
+	t.Cleanup(func() {
+		plainCloneContext = oldClone
+		listRemoteRefs = oldList
+	})
+
+	wantErr := errors.New("transport failure")
+	var listCalled bool
+
+	plainCloneContext = func(ctx context.Context, path string, isBare bool, o *git.CloneOptions) (*git.Repository, error) {
+		return nil, wantErr
+	}
+	listRemoteRefs = func(ctx context.Context, repoURL string, insecure bool) ([]*plumbing.Reference, error) {
+		listCalled = true
+		return nil, nil
+	}
+
+	worker := &Worker{
+		maxCloneSeconds: 300,
+		l:               slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	}
+
+	_, err := worker.cloneRepo("https://example.test/owner/repo", filepath.Join(t.TempDir(), "clone"))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected transport error, got: %v", err)
+	}
+	if listCalled {
+		t.Fatal("remote ref listing should not run for non-reference errors")
 	}
 }
 
